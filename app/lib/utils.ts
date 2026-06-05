@@ -19,9 +19,36 @@ export function formatDate(ts: number): string {
   });
 }
 
+/**
+ * 从 LLM 返回内容中提取 SQL 语句
+ * 优先匹配 ```sql / ``` 代码块，无代码块时按行扫描包含 SELECT 关键字的行
+ */
 export function extractSQL(content: string): string {
-  const match = content.match(/```(?:sql)?\s*([\s\S]*?)```/i);
-  return match ? match[1].trim() : content.trim();
+  // 1. 匹配 ```sql ... ``` 代码块（贪婪匹配，确保取到完整的代码块）
+  const sqlBlockMatch = content.match(/```sql\s*([\s\S]*?)\s*```/i);
+  if (sqlBlockMatch) return sqlBlockMatch[1].trim();
+
+  // 2. 匹配 ``` ... ``` 代码块（无语言标识）
+  const codeBlockMatch = content.match(/```\s*([\s\S]*?)\s*```/);
+  if (codeBlockMatch) return codeBlockMatch[1].trim();
+
+  // 3. 兜底：提取内容中第一个包含 SELECT / WITH / SHOW 关键字的行到最后
+  //    注意：不能只检查 startsWith，因为 LLM 可能返回 "SQL如下：SELECT ..."
+  const lines = content.split('\n');
+  let startIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const lowerLine = lines[i].toLowerCase();
+    if (lowerLine.includes('select') || lowerLine.includes('with') || lowerLine.includes('show')) {
+      startIdx = i;
+      break;
+    }
+  }
+  if (startIdx !== -1) {
+    return lines.slice(startIdx).join('\n').trim();
+  }
+
+  // 4. 完全找不到 SQL 特征，返回原始内容去空白
+  return content.trim();
 }
 
 export function isValidSQL(sql: string): boolean {
@@ -41,6 +68,14 @@ const SYSTEM_TABLES = [
   'information_schema', 'mysql', 'performance_schema', 'sys',
 ];
 
+/** 移除 SQL 中的注释（单行 -- 和多行块注释） */
+function stripSQLComments(sql: string): string {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, '')   // 多行注释 /* ... */
+    .replace(/--.*$/gm, '')               // 单行注释 -- ...
+    .trim();
+}
+
 export function isUnsafeSQL(sql: string): { safe: boolean; reason?: string } {
   const lower = sql.toLowerCase();
 
@@ -52,10 +87,16 @@ export function isUnsafeSQL(sql: string): { safe: boolean; reason?: string } {
     }
   }
 
-  // Must start with SELECT or WITH
-  const trimmed = lower.trim();
-  if (!trimmed.startsWith('select') && !trimmed.startsWith('with') && !trimmed.startsWith('show')) {
-    return { safe: false, reason: '仅支持 SELECT 查询语句。' };
+  // Must contain or start with SELECT/WITH/SHOW
+  // 先移除注释再检查，避免注释开头的 SQL 被误杀
+  // 同时允许 "SQL如下：SELECT ..." 这种前面有说明文字的情况
+  const cleanSQL = stripSQLComments(lower);
+  const startsWithQuery = cleanSQL.startsWith('select') || cleanSQL.startsWith('with') || cleanSQL.startsWith('show');
+  const containsQuery = cleanSQL.includes('select') || cleanSQL.includes('with') || cleanSQL.includes('show');
+
+  if (!startsWithQuery && !containsQuery) {
+    // 既不包含也不以 SELECT 开头 → 大概率是 LLM 没生成有效 SQL（返回了解释文字）
+    return { safe: false, reason: 'AI 生成的查询语句格式不正确，请重新描述您的问题。' };
   }
 
   // Check for system table access
@@ -131,6 +172,38 @@ export function validateUserQuestion(question: string): { valid: boolean; reason
 
   if (!hasQueryKeyword && q.length < 10) {
     return { valid: false, reason: '指令过于简短或不完整。请描述您想查询的数据内容，例如："查询用户表中前10条记录"或"统计各品类的销售额占比"' };
+  }
+
+  // Check for data modification / dangerous intent (early interception)
+  const modificationKeywords = [
+    '删除', '删掉', '清空', 'truncate', 'drop', '删表',
+    '插入', '新增', '添加', 'insert',
+    '修改', '更新', '改动', 'update', '更改', '替换', 'replace',
+    '创建表', 'create table', '建表', 'grant', 'revoke',
+  ];
+  const hasModificationIntent = modificationKeywords.some((kw) =>
+    q.toLowerCase().includes(kw.toLowerCase())
+  );
+
+  if (hasModificationIntent) {
+    // If it also has explicit query keywords, it might be a query about modified data
+    // e.g. "查询已删除的订单" -> should pass (contains 查询)
+    // e.g. "把删除记录给我看" -> should pass (contains 给我 / 看)
+    const queryIndicators = [
+      '查询', '查看', '统计', '分析', '列出', '显示', '检索',
+      '给我', '找', '搜', '查', '看看', '有哪些', '是什么', '有多少',
+      '找出来', '列举', '告诉我', '展示',
+    ];
+    const isQueryingModifiedData = queryIndicators.some((kw) =>
+      q.toLowerCase().includes(kw.toLowerCase())
+    );
+
+    if (!isQueryingModifiedData) {
+      return {
+        valid: false,
+        reason: '检测到数据修改操作意图（INSERT / DELETE / UPDATE / DROP / TRUNCATE 等）。本产品仅支持数据查询（SELECT），不支持任何数据修改操作。',
+      };
+    }
   }
 
   // Check for harmful instructions (basic prompt injection check)

@@ -1,6 +1,6 @@
 'use client';
 
-import { Clock, CheckCircle, XCircle, Loader2 } from 'lucide-react';
+import { Clock, CheckCircle, XCircle, Loader2, Ban } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { TimelineStep } from '@/app/types';
 import { formatDate } from '@/app/lib/utils';
@@ -17,6 +17,8 @@ function StatusIcon({ status }: { status: TimelineStep['status'] }) {
       return <CheckCircle className="h-3.5 w-3.5 text-emerald-500" />;
     case 'error':
       return <XCircle className="h-3.5 w-3.5 text-rose-500" />;
+    case 'cancelled':
+      return <Ban className="h-3.5 w-3.5 text-stone-400" />;
     default:
       return <Clock className="h-3.5 w-3.5 text-stone-300" />;
   }

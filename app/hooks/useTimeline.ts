@@ -35,6 +35,36 @@ export function useTimeline() {
     updateStep(id, { status: 'error', detail });
   }, [updateStep]);
 
+  const cancelStep = useCallback((id: string, detail?: string) => {
+    updateStep(id, { status: 'cancelled', detail });
+  }, [updateStep]);
+
+  /**
+   * 批量将所有 running 步骤标记为失败（异常兜底）
+   */
+  const failAllRunning = useCallback((detail?: string) => {
+    setSteps((prev) =>
+      prev.map((s) =>
+        s.status === 'running'
+          ? { ...s, status: 'error', detail: detail || s.detail, timestamp: Date.now() }
+          : s
+      )
+    );
+  }, []);
+
+  /**
+   * 批量将所有 running 步骤标记为取消（用户取消兜底）
+   */
+  const cancelAllRunning = useCallback((detail?: string) => {
+    setSteps((prev) =>
+      prev.map((s) =>
+        s.status === 'running'
+          ? { ...s, status: 'cancelled', detail: detail || s.detail, timestamp: Date.now() }
+          : s
+      )
+    );
+  }, []);
+
   const clearSteps = useCallback(() => {
     setSteps([]);
   }, []);
@@ -50,6 +80,9 @@ export function useTimeline() {
     updateStep,
     completeStep,
     failStep,
+    cancelStep,
+    failAllRunning,
+    cancelAllRunning,
     clearSteps,
   };
 }

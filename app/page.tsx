@@ -44,6 +44,7 @@ export default function Home() {
     if (savedConvs.length > 0) {
       setActiveConvId(savedConvs[0].id);
       chat.setMessages(savedConvs[0].messages);
+      timeline.setSteps(savedConvs[0].timeline);
     }
 
     const savedLlm = storage.getLlmConfig();
@@ -190,7 +191,10 @@ export default function Home() {
 
   const handleCancel = useCallback(() => {
     chat.cancel();
-    timeline.addStep('用户操作', '用户取消了当前请求');
+    const stepId = timeline.addStep('用户操作', '用户取消了当前请求');
+    timeline.cancelStep(stepId, '用户已取消当前请求');
+    // 把 processQuestion 中还在转圈的步骤全部标记为取消，避免卡死
+    timeline.cancelAllRunning('用户已取消');
     chat.addMessage({
       role: 'assistant',
       content: '用户已取消当前请求',
@@ -248,86 +252,99 @@ export default function Home() {
 
       const stepIds: Record<string, string> = {};
 
-      const onTimelineUpdate = (title: string, detail: string) => {
-        if (!stepIds[title]) {
-          stepIds[title] = timeline.addStep(title, detail);
-        } else {
-          timeline.updateStep(stepIds[title], { detail });
-        }
-        if (detail.includes('失败') || detail.includes('错误')) {
-          timeline.failStep(stepIds[title], detail);
-        } else if (detail.includes('成功') || detail.includes('完成')) {
-          timeline.completeStep(stepIds[title], detail);
-        }
+      const callbacks = {
+        onTimelineUpdate: (title: string, detail: string) => {
+          if (!stepIds[title]) {
+            stepIds[title] = timeline.addStep(title, detail);
+          } else {
+            timeline.updateStep(stepIds[title], { detail });
+          }
+          if (detail.includes('失败') || detail.includes('错误')) {
+            timeline.failStep(stepIds[title], detail);
+          } else if (detail.includes('成功') || detail.includes('完成')) {
+            timeline.completeStep(stepIds[title], detail);
+          }
+        },
+        // ★★★ 阶段输出：SQL 生成完成，立即显示
+        onSQLGenerated: (sql: string) => {
+          chat.addMessage({
+            role: 'assistant',
+            content: sql,
+            type: 'sql',
+            sql,
+          });
+        },
+        // ★★★ 阶段输出：查询执行完成，立即显示结果表格
+        onQueryResult: (result: { columns: string[]; data: Record<string, unknown>[] }) => {
+          const tableMd = formatQueryResultTable(result.columns, result.data);
+          chat.addMessage({
+            role: 'assistant',
+            content: `查询结果（共 ${result.data.length} 条）：\n\n${tableMd}`,
+            type: 'text',
+          });
+        },
+        // ★★★ 阶段输出：图表生成完成，立即显示
+        onChartOption: (option: Record<string, unknown> | null) => {
+          if (option) {
+            chat.addMessage({
+              role: 'assistant',
+              content: '',
+              type: 'chart',
+              chartOption: option,
+            });
+          }
+        },
+        // ★★★ 阶段输出：分析开始，创建流式消息占位（内容由 analyzeStream.content 实时同步）
+        onAnalysisStart: () => {
+          const analysisMsg = chat.addMessage({
+            role: 'assistant',
+            content: '',
+            type: 'analysis',
+            isStreaming: true,
+          });
+          analysisMsgIdRef.current = analysisMsg.id;
+        },
       };
 
       try {
-        const result = await chat.processQuestion(
+        await chat.processQuestion(
           question,
           dbConn.activeDb,
           dbConn.schemas,
           dbConn.tableNotes,
           llmConfig,
-          onTimelineUpdate,
+          callbacks,
           dbConn.selectedTables
         );
 
-        if (!result) return;
-
-        // Add SQL message
-        chat.addMessage({
-          role: 'assistant',
-          content: result.sql,
-          type: 'sql',
-          sql: result.sql,
-        });
-
-        // Add query result table
-        const { columns, data } = result.queryResult;
-        const tableMd = formatQueryResultTable(columns, data);
-        chat.addMessage({
-          role: 'assistant',
-          content: `查询结果（共 ${data.length} 条）：\n\n${tableMd}`,
-          type: 'text',
-        });
-
-        // Add chart only if needed
-        if (result.chartOption) {
-          chat.addMessage({
-            role: 'assistant',
-            content: '',
-            type: 'chart',
-            chartOption: result.chartOption,
-          });
-        }
-
-        // Add analysis only if needed
-        if (result.analysis !== null) {
-          const analysisMsg = chat.addMessage({
-            role: 'assistant',
-            content: result.analysis || '',
-            type: 'analysis',
-            isStreaming: true,
-          });
-          analysisMsgIdRef.current = analysisMsg.id;
-
+        // 流程全部完成后，停止分析消息的流式状态
+        if (analysisMsgIdRef.current) {
           setTimeout(() => {
-            chat.updateMessage(analysisMsg.id, { isStreaming: false });
-            analysisMsgIdRef.current = null;
+            if (analysisMsgIdRef.current) {
+              chat.updateMessage(analysisMsgIdRef.current, { isStreaming: false });
+              analysisMsgIdRef.current = null;
+            }
           }, 300);
-
-          timeline.completeStep(stepIds['数据分析'], '分析结论生成完成');
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        // 用户主动取消（AbortError）
         if (msg.includes('aborted') || msg.includes('AbortError')) {
+          timeline.cancelAllRunning('用户已取消');
           return;
         }
+        // 真正的异常：添加错误消息，并把还在转圈的步骤全部标记为失败
         chat.addMessage({
           role: 'assistant',
           content: msg,
           type: 'error',
         });
+        timeline.failAllRunning('任务因异常终止');
+        // 出错时也要停止分析流式状态
+        if (analysisMsgIdRef.current) {
+          chat.updateMessage(analysisMsgIdRef.current, { isStreaming: false });
+          analysisMsgIdRef.current = null;
+        }
       }
     },
     [

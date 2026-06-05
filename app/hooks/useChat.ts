@@ -14,11 +14,12 @@ import { formatSchema, formatQueryResult } from '@/app/lib/schema';
 import { extractSQL, isUnsafeSQL, isQueryingUnselectedTables, validateUserQuestion } from '@/app/lib/utils';
 import { chatCompletion } from '@/app/lib/llm';
 
-interface ProcessResult {
-  sql: string;
-  queryResult: QueryResult;
-  chartOption: Record<string, unknown> | null;
-  analysis: string | null;
+export interface ProcessCallbacks {
+  onTimelineUpdate: (title: string, detail: string) => void;
+  onSQLGenerated: (sql: string) => void;
+  onQueryResult: (result: QueryResult) => void;
+  onChartOption: (option: Record<string, unknown> | null) => void;
+  onAnalysisStart: () => void;
 }
 
 function needsVisualization(question: string, rowCount: number): boolean {
@@ -68,9 +69,11 @@ export function useChat() {
       schemas: TableSchema[],
       tableNotes: Record<string, string>,
       llmConfig: LlmConfig,
-      onTimelineUpdate?: (step: string, detail: string) => void,
+      callbacks: ProcessCallbacks,
       selectedTables: string[] = []
-    ): Promise<ProcessResult | null> => {
+    ): Promise<void> => {
+      const { onTimelineUpdate, onSQLGenerated, onQueryResult, onChartOption, onAnalysisStart } = callbacks;
+
       setProcessing(true);
       setProcessStep('正在分析需求...');
       setElapsed(0);
@@ -79,12 +82,12 @@ export function useChat() {
       try {
         // ====== Step 0: Intent Recognition ======
         setProcessStep('正在识别意图...');
-        onTimelineUpdate?.('意图识别', '分析用户指令是否有效');
+        onTimelineUpdate('意图识别', '分析用户指令是否有效');
 
         // Fast local check first
         const localCheck = validateUserQuestion(question);
         if (!localCheck.valid) {
-          onTimelineUpdate?.('意图识别', `无效指令：${localCheck.reason}`);
+          onTimelineUpdate('意图识别', `失败：无效指令，${localCheck.reason}`);
           throw new Error(localCheck.reason);
         }
 
@@ -98,20 +101,20 @@ export function useChat() {
           if (validMatch && validMatch[1].toLowerCase() === 'false') {
             const reasonMatch = intentResult.match(/reason:\s*(.+)/i);
             const reason = reasonMatch ? reasonMatch[1].trim() : '请输入有效的数据查询指令';
-            onTimelineUpdate?.('意图识别', `无效指令：${reason}`);
+            onTimelineUpdate('意图识别', `失败：无效指令，${reason}`);
             throw new Error(reason);
           }
         } catch {
           // If AI intent check fails, rely on local check (already passed)
         }
 
-        onTimelineUpdate?.('意图识别', '指令有效，开始处理');
+        onTimelineUpdate('意图识别', '完成：指令有效，开始处理');
 
         const schemaText = formatSchema(schemas, tableNotes);
 
         // Step 1: Generate SQL
         setProcessStep('正在生成 SQL...');
-        onTimelineUpdate?.('生成 SQL', '请求大模型生成查询语句');
+        onTimelineUpdate('生成 SQL', '请求大模型生成查询语句');
 
         const sqlPrompt = generateSQLPrompt(question, schemaText);
         const sqlContent = await sqlStream.stream('/api/llm/generate-sql', {
@@ -122,12 +125,16 @@ export function useChat() {
         });
 
         let sql = extractSQL(sqlContent);
-        onTimelineUpdate?.('生成 SQL', `生成SQL完成: ${sql.substring(0, 200)}...`);
+        onTimelineUpdate('生成 SQL', `完成：生成SQL完成: ${sql.substring(0, 200)}...`);
+
+        // ★★★ 阶段输出：SQL 生成完成，立即输出到前端
+        onSQLGenerated(sql);
 
         // ====== Security Check 1: SQL Safety ======
+        onTimelineUpdate('安全检查', '进行中：正在检查 SQL 安全性...');
         const safetyCheck = isUnsafeSQL(sql);
         if (!safetyCheck.safe) {
-          onTimelineUpdate?.('安全检查', `拦截：${safetyCheck.reason}`);
+          onTimelineUpdate('安全检查', `失败：${safetyCheck.reason}`);
           throw new Error(safetyCheck.reason);
         }
 
@@ -135,13 +142,16 @@ export function useChat() {
         if (selectedTables.length > 0) {
           const tableCheck = isQueryingUnselectedTables(sql, selectedTables);
           if (!tableCheck.allowed) {
-            onTimelineUpdate?.('安全检查', `拦截：${tableCheck.reason}`);
+            onTimelineUpdate('安全检查', `失败：${tableCheck.reason}`);
             throw new Error(tableCheck.reason);
           }
         }
 
+        onTimelineUpdate('安全检查', '完成：安全检查通过');
+
         // Step 2: Execute SQL with retry
         setProcessStep('正在执行查询...');
+        onTimelineUpdate('执行查询', '进行中：正在执行 SQL 查询...');
         let queryResult: QueryResult | null = null;
         let lastError = '';
 
@@ -162,11 +172,11 @@ export function useChat() {
             const data = await res.json();
             if (data.success) {
               queryResult = { columns: data.columns, data: data.data };
-              onTimelineUpdate?.('执行查询', `查询成功，返回 ${data.data.length} 行数据`);
+              onTimelineUpdate('执行查询', `完成：查询成功，返回 ${data.data.length} 行数据`);
               break;
             } else {
               lastError = data.error;
-              onTimelineUpdate?.('执行查询', `第${attempt + 1}次尝试失败: ${lastError}`);
+              onTimelineUpdate('执行查询', `失败：第${attempt + 1}次尝试失败，${lastError}`);
               if (attempt < 2) {
                 setProcessStep(`查询失败，正在修正 SQL（第${attempt + 2}次尝试）...`);
                 const fixPrompt = regenerateSQLPrompt(question, schemaText, sql, lastError);
@@ -181,14 +191,14 @@ export function useChat() {
                 // Re-check safety after fix
                 const fixSafety = isUnsafeSQL(sql);
                 if (!fixSafety.safe) {
-                  onTimelineUpdate?.('安全检查', `拦截修正后的SQL：${fixSafety.reason}`);
+                  onTimelineUpdate('安全检查', `失败：修正后的 SQL 未通过安全检查，${fixSafety.reason}`);
                   throw new Error(fixSafety.reason);
                 }
               }
             }
           } catch (err: unknown) {
             lastError = err instanceof Error ? err.message : String(err);
-            onTimelineUpdate?.('执行查询', `第${attempt + 1}次尝试异常: ${lastError}`);
+            onTimelineUpdate('执行查询', `失败：第${attempt + 1}次尝试异常，${lastError}`);
           }
         }
 
@@ -196,16 +206,18 @@ export function useChat() {
           throw new Error(`查询执行失败，已重试3次。最后一次错误: ${lastError}`);
         }
 
+        // ★★★ 阶段输出：查询执行完成，立即输出结果表格到前端
+        onQueryResult(queryResult);
+
         // 判断是否需要图表和分析
         const shouldVisualize = needsVisualization(question, queryResult.data.length);
 
         let chartOption: Record<string, unknown> | null = null;
-        let analysisContent: string | null = null;
 
         if (shouldVisualize) {
           // Step 3: Generate Chart
           setProcessStep('正在生成图表...');
-          onTimelineUpdate?.('生成图表', '请求大模型生成 ECharts 配置');
+          onTimelineUpdate('生成图表', '请求大模型生成 ECharts 配置');
 
           const chartPrompt = generateChartPrompt(
             question,
@@ -224,32 +236,34 @@ export function useChat() {
           });
           const chartData = await chartRes.json();
           chartOption = chartData.success ? chartData.option : null;
-          onTimelineUpdate?.('生成图表', chartData.success ? '图表配置生成成功' : `图表生成失败: ${chartData.error}`);
+          onTimelineUpdate('生成图表', chartData.success ? '完成：图表配置生成成功' : `失败：图表生成失败: ${chartData.error}`);
+
+          // ★★★ 阶段输出：图表生成完成，立即输出到前端
+          onChartOption(chartOption);
 
           // Step 4: Generate Analysis
           setProcessStep('正在分析数据...');
-          onTimelineUpdate?.('数据分析', '请求大模型生成分析结论');
+          onTimelineUpdate('数据分析', '请求大模型生成分析结论');
+
+          // ★★★ 阶段输出：分析开始，创建流式消息占位
+          onAnalysisStart();
 
           const analyzePrompt = generateAnalysisPrompt(
             question,
             schemaText,
             formatQueryResult(queryResult.columns, queryResult.data)
           );
-          analysisContent = await analyzeStream.stream('/api/llm/analyze', {
+          await analyzeStream.stream('/api/llm/analyze', {
             apiUrl: llmConfig.apiUrl,
             apiKey: llmConfig.apiKey,
             model: llmConfig.model,
             messages: [{ role: 'user', content: analyzePrompt }],
           });
-          onTimelineUpdate?.('数据分析', '分析结论生成完成');
+          onTimelineUpdate('数据分析', '完成：分析结论生成完成');
+        } else {
+          // 不需要图表和分析
+          onChartOption(null);
         }
-
-        return {
-          sql,
-          queryResult,
-          chartOption,
-          analysis: analysisContent,
-        };
       } finally {
         clearInterval(timer);
         setProcessing(false);

@@ -52,7 +52,7 @@ export interface ChatMessage {
 export interface TimelineStep {
   id: string;
   title: string;
-  status: 'pending' | 'running' | 'success' | 'error';
+  status: 'pending' | 'running' | 'success' | 'error' | 'cancelled';
   content?: string;
   detail?: string;
   timestamp?: number;
