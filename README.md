@@ -258,3 +258,15 @@ components/ui/                  # Shadcn/ui 基础组件
 ## License
 
 MIT
+
+## 📧 联系方式
+
+如有问题或建议，请通过以下方式联系：
+
+- 提交 [GitHub Issue](https://github.com/duke-mar/ask-data/issues)
+- 发送邮件至：741135108@qq.com
+
+---
+
+<p align="center">如果这个项目对你有帮助，请给个 ⭐ Star 支持一下！</p>
+
